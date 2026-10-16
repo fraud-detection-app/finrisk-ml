@@ -35,10 +35,18 @@ def test_training_request_has_the_shape_the_contract_promises():
     assert r["ResourceConfig"] == {"InstanceType": "ml.m5.large", "InstanceCount": 1, "VolumeSizeInGB": 30}
     assert r["StoppingCondition"] == {"MaxRuntimeInSeconds": 1800}
     assert r["RoleArn"] == ROLE
-    assert r["HyperParameters"] == {"model_type": "optimized"}
+    # What config/train.yaml says, whatever it says today: lab 9b of the course flips it to `baseline` in a pull request.
+    cfg = mlops.load_train_config(mlops.DEFAULT_CONFIG)
+    assert r["HyperParameters"] == {"model_type": cfg.model_type}
+    assert r["Environment"]["MODEL_TYPE"] == cfg.model_type
     assert r["Environment"]["METRICS_S3_URI"] == f"s3://{BUCKET}/metrics/finrisk-train-1/metrics.json"
     assert r["Environment"]["ML_GIT_SHA"] == "a" * 40
     assert {t["Key"] for t in r["Tags"]} >= {"Project", "ManagedBy", "MlGitSha"}
+
+
+def test_the_configured_model_type_is_one_the_trainer_accepts():
+    """The contract of the config's model_type, not its value: optimized (XGBoost) or baseline (logistic regression)."""
+    assert mlops.load_train_config(mlops.DEFAULT_CONFIG).model_type in ("optimized", "baseline")
 
 
 def test_the_model_type_flag_overrides_the_config():
