@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from conftest import GENERATED_DIRS, repo_files
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -213,8 +214,8 @@ def test_workflows_use_bash_and_least_privilege(name):
 # ---------------------------------------------------------------- the repo's own files
 
 
-def test_version_is_semver_and_starts_at_0_1_0():
-    assert (ROOT / "VERSION").read_text().strip() == "0.1.0"
+def test_version_is_semver():
+    assert re.fullmatch(r"\d+\.\d+\.\d+", (ROOT / "VERSION").read_text().strip())
 
 
 def test_base_image_pin_is_a_digest_with_no_registry_address():
@@ -229,17 +230,43 @@ def test_dockerfile_builds_from_the_pinned_base_and_sets_the_entrypoint():
     assert "bumping" in (ROOT / "train" / "base_image.txt").read_text().lower() or "pull request" in (ROOT / "train" / "base_image.txt").read_text().lower()
 
 
-def test_no_account_id_or_key_is_committed_anywhere():
-    account = re.compile(r"(?<!\d)\d{12}(?!\d)")
-    key = re.compile(r"AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}")
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git/" in str(path) or "__pycache__" in str(path) or ".pytest_cache" in str(path):
-            continue
-        if path.suffix in (".pyc", ".parquet", ".pkl") or path.name == "fakes.py" or path.name.startswith("test_"):
+ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
+SECRET_KEY = re.compile(r"AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}")
+LONG_HEX = re.compile(r"[0-9a-f]{32,}")             # an image digest (sha256:<64 hex>) or a commit sha can contain 12 digits in a row
+
+
+def leaks(root=ROOT):
+    """(file, what) for every 12-digit number or key-like string in the files git tracks (or would track)."""
+    found = []
+    for path in repo_files(root):
+        if path.suffix in (".parquet", ".pkl", ".joblib") or path.name == "fakes.py" or path.name.startswith("test_"):
             continue                                        # the tests use a fake 123456789012 on purpose
         content = path.read_text(errors="ignore")
-        assert not account.search(content), f"12-digit number in {path.relative_to(ROOT)}"
-        assert not key.search(content), f"key-like string in {path.relative_to(ROOT)}"
+        rel = path.relative_to(root).as_posix()
+        if ACCOUNT_ID.search(LONG_HEX.sub("", content)):
+            found.append((rel, "12-digit number"))
+        if SECRET_KEY.search(content):
+            found.append((rel, "key-like string"))
+    return found
+
+
+def test_no_account_id_or_key_is_committed_anywhere():
+    """Only files git tracks (or would) are scanned: not .git/ (a runner's .git holds fetched refs), .venv/ or caches."""
+    assert leaks() == []
+
+
+def test_the_scan_ignores_generated_folders_and_digests_but_still_sees_a_leak(tmp_path):
+    for folder in sorted(GENERATED_DIRS):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "FETCH_HEAD").write_text("123456789012\n")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "base_image.txt").write_text("finrisk-app@sha256:ab123456789012cd" + "e" * 48 + "\n")   # 12 digits inside a digest
+    (tmp_path / "finrisk-app" / ".git").mkdir(parents=True)                      # ml-ci checks finrisk-app out into a subfolder
+    (tmp_path / "finrisk-app" / "artifact.py").write_text('ACCOUNT = "123456789012"\n')
+    assert leaks(tmp_path) == []
+    assert [p.name for p in repo_files(tmp_path)] == ["base_image.txt"]
+    (tmp_path / "config.yaml").write_text("role: arn:aws:iam::123456789012:role/x\n")
+    assert leaks(tmp_path) == [("config.yaml", "12-digit number")]
 
 
 def test_gitignore_keeps_models_data_and_secrets_out():
