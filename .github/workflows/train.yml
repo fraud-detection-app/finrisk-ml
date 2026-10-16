@@ -1,0 +1,149 @@
+# Train a model, check it, register it. Slow, costs money and gives a different answer each time, so it is
+# NOT part of any deploy: a person (Actions tab -> Run workflow), a merge that changes how we train, or the
+# weekly schedule starts it.
+#
+#   image -> prepare-data -> train -> evaluate (THE GATE) -> register
+#
+#   image         build + push finrisk-train:sha-<this commit> (skipped when that tag already exists)
+#   prepare-data  the training image makes the gold feature table; upload to s3://<ml>/data/<time>/
+#   train         a SageMaker training job (ml.m5.large, at most 30 min) runs the image on that data
+#   evaluate      the gate: PR-AUC >= 0.70 AND >= the model running in prod minus 0.02 (config/train.yaml).
+#                 If it fails the job stops here, the summary says why, and NOTHING is registered.
+#   register      a new numbered version in the Model Registry, status PendingManualApproval
+#
+# A registered version then waits for a person (approve-model.yml) and moves on with promote-model.yml.
+#
+# What this workflow needs (set once; finrisk-infra/scripts/github_bootstrap.sh does it from the Terraform outputs)
+# -----------------------------------------------------------------------------------------------------
+#   name                      kind      where                   what
+#   AWS_ROLE_ARN              secret    Environment `ml`        role finrisk-ml-train (OIDC; no AWS key anywhere)
+#   AWS_REGION                variable  repository              ap-southeast-2
+# The Environment `ml` only accepts runs from `main`. Role ARNs are secrets because they contain the account id
+# and this repo is public. One rule for all four repos: a job WITH `environment:` reads the Environment secret
+# AWS_ROLE_ARN (each Environment holds its own role). The ML bucket, the SageMaker role and the registry address are looked up at run time.
+name: train
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: "config = what config/train.yaml says; baseline = logistic regression (a worse model, to watch the gate say no)"
+        type: choice
+        options: [config, optimized, baseline]
+        default: config
+  push:
+    branches: [main]
+    paths: ["train/**", "pipeline/**", "config/**"]
+  schedule:
+    - cron: "0 16 * * 0" # every Sunday 16:00 UTC = Monday 02:00 in Sydney: retrain on whatever the data is by then
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train # one training run at a time
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  train:
+    name: train, check, register
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: ml
+    permissions:
+      id-token: write # lets the job ask GitHub for the OIDC token that AWS exchanges for the role
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      MODEL_TYPE_CHOICE: ${{ inputs.model_type }}
+      PYTHONUNBUFFERED: "1" # print the training job's status lines as they happen
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: train-${{ github.run_id }}
+
+      # Secrets are hidden already; this also hides the NEW strings built from the account id in what AWS prints.
+      - name: Hide the account id in what AWS prints
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3 and pyyaml (all that pipeline/mlops.py needs)
+        run: pip install --quiet -r requirements.txt
+
+      # The training image: the app image (pinned by digest in train/base_image.txt) + train/sagemaker_train.py.
+      # Tagged with THIS repo's commit; a commit that changes nothing in train/ finds its image already there.
+      - name: Training image (build + push if this commit has none yet)
+        run: |
+          PIN="$(grep -v '^[[:space:]]*#' train/base_image.txt | grep -v '^[[:space:]]*$' | head -n 1)"
+          if [[ ! "$PIN" =~ ^[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error title=Bad base image pin::train/base_image.txt must hold <repository>@sha256:<64 hex>, got '$PIN'"
+            exit 1
+          fi
+          if [[ "$PIN" == *@sha256:0000000000000000000000000000000000000000000000000000000000000000 ]]; then
+            echo "::error title=Base image not pinned yet::train/base_image.txt still has the placeholder digest. Copy the digest of the finrisk-app image from ECR and change the line with a pull request."
+            exit 1
+          fi
+          TAG="sha-${GITHUB_SHA}"
+          REPO_URI="${REGISTRY}/finrisk-train"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          if DIGEST="$(aws ecr describe-images --repository-name finrisk-train --image-ids "imageTag=$TAG" --query 'imageDetails[0].imageDigest' --output text 2>"$RUNNER_TEMP/ecr.err")"; then
+            echo "finrisk-train:$TAG already exists ($DIGEST): not rebuilding"
+          elif grep -q ImageNotFoundException "$RUNNER_TEMP/ecr.err"; then
+            echo "building finrisk-train:$TAG FROM $PIN"
+            # linux/amd64: ml.m5.large is an Intel machine. --provenance=false: one plain image manifest, no extras.
+            docker build --platform linux/amd64 --provenance=false -f train/Dockerfile --build-arg "BASE_IMAGE=${REGISTRY}/${PIN}" -t "${REPO_URI}:${TAG}" .
+            docker push "${REPO_URI}:${TAG}"
+            DIGEST="$(aws ecr describe-images --repository-name finrisk-train --image-ids "imageTag=$TAG" --query 'imageDetails[0].imageDigest' --output text)"
+          else
+            cat "$RUNNER_TEMP/ecr.err"
+            exit 1
+          fi
+          docker pull --quiet "${REPO_URI}@${DIGEST}" # make sure the digest form is on this runner for the next step
+          echo "TRAIN_IMAGE=${REPO_URI}@${DIGEST}" >> "$GITHUB_ENV"
+          echo "training image: finrisk-train@${DIGEST}"
+
+      # Each command prints its progress and ends with ONE value on the last line: the next step's input.
+      - name: 1/4 prepare-data
+        run: |
+          python pipeline/mlops.py prepare-data --image "$TRAIN_IMAGE" | tee "$RUNNER_TEMP/data.out"
+          echo "DATA_URI=$(tail -n 1 "$RUNNER_TEMP/data.out")" >> "$GITHUB_ENV"
+
+      - name: 2/4 train (a SageMaker training job; takes several minutes)
+        env:
+          ML_GIT_SHA: ${{ github.sha }}
+        run: |
+          ARGS=(--image "$TRAIN_IMAGE" --data "$DATA_URI")
+          if [ "$MODEL_TYPE_CHOICE" = optimized ] || [ "$MODEL_TYPE_CHOICE" = baseline ]; then ARGS+=(--model-type "$MODEL_TYPE_CHOICE"); fi
+          python pipeline/mlops.py train "${ARGS[@]}" | tee "$RUNNER_TEMP/train.out"
+          JOB="$(tail -n 1 "$RUNNER_TEMP/train.out")"
+          echo "TRAINING_JOB=$JOB" >> "$GITHUB_ENV"
+          {
+            echo "### Training run"
+            echo ""
+            echo "- training job: \`$JOB\`"
+            echo "- data version: \`$(basename "${DATA_URI%/}")\`"
+            echo "- training image: \`finrisk-train@${TRAIN_IMAGE#*@}\`"
+            echo "- ml commit: \`${GITHUB_SHA:0:12}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # THE GATE. Exit code 3 = the candidate is not good enough: this step fails, the next one never runs.
+      - name: 3/4 evaluate (the gate)
+        run: python pipeline/mlops.py evaluate --training-job "$TRAINING_JOB" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: 4/4 register
+        run: python pipeline/mlops.py register --training-job "$TRAINING_JOB" --summary "$GITHUB_STEP_SUMMARY"

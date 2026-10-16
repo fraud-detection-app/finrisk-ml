@@ -1,0 +1,4 @@
+# What the PIPELINE needs (the runner runs pipeline/mlops.py): AWS calls and the config file.
+# No pandas, no scikit-learn: the training itself runs inside the training image.
+boto3>=1.34.0
+pyyaml>=6.0

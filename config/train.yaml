@@ -1,0 +1,28 @@
+# Everything you may want to change about a training run, in one reviewed file.
+# Changing it in a pull request and merging it starts a new training run (train.yml watches config/**).
+
+# What the training job runs. These become SageMaker HyperParameters (and MODEL_TYPE inside the job).
+#   optimized = tuned XGBoost      baseline = logistic regression
+hyperparameters:
+  model_type: optimized
+
+# The computer SageMaker rents for the job. It is billed per second, only while the job runs.
+instance:
+  type: ml.m5.large
+  count: 1
+  volume_gb: 30
+  max_runtime_seconds: 1800     # SageMaker stops the job here, so a stuck job cannot bill for hours
+
+# The demo data: synthetic PaySim-like rows, made inside the training image by scripts/run_pipeline.py.
+data:
+  demo_rows: 5000
+
+# The GATE: a new model must pass both rules to be registered at all.
+#   1. floor      PR-AUC of the candidate must be at least this (an absolute minimum)
+#   2. champion   PR-AUC must be at least (champion - tolerance): not noticeably worse than what runs
+#                 in production now. The champion is the model in /finrisk/<champion_env>/model, or none.
+gate:
+  metric: pr_auc
+  floor: 0.70
+  tolerance: 0.02
+  champion_env: prod
