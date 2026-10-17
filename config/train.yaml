@@ -4,7 +4,7 @@
 # What the training job runs. These become SageMaker HyperParameters (and MODEL_TYPE inside the job).
 #   optimized = tuned XGBoost      baseline = logistic regression
 hyperparameters:
-  model_type: baseline
+  model_type: optimized
 
 # The computer SageMaker rents for the job. It is billed per second, only while the job runs.
 instance:
