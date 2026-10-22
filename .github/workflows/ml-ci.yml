@@ -8,10 +8,10 @@
 # finrisk-infra). Renaming it blocks every merge until the ruleset is changed too.
 name: ml-ci
 
+# Pull requests only. The ruleset requires a pull request to be up to date with main before it merges, so the code a
+# squash merge puts on main is exactly the code these checks passed; a second run on main would test nothing new.
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read # the least a job needs: read the code. Nothing here writes to the repository.
