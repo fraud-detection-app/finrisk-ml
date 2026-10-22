@@ -61,9 +61,9 @@ def test_every_job_runs_on_the_pinned_runner_image():
 # ---------------------------------------------------------------- ml-ci
 
 
-def test_ml_ci_runs_pytest_in_a_job_called_test_on_prs_and_main():
+def test_ml_ci_runs_pytest_in_a_job_called_test_on_pull_requests():
     wf = load("ml-ci")
-    assert set(wf["on"]) == {"pull_request", "push"} and wf["on"]["push"]["branches"] == ["main"]
+    assert set(wf["on"]) == {"pull_request"}   # PRs only: the ruleset makes them up to date with main
     assert list(wf["jobs"]) == ["test"] and wf["jobs"]["test"]["name"] == "test"
     assert any("pytest" in s.get("run", "") for s in steps(wf["jobs"]["test"]))
     assert "id-token" not in str(wf["permissions"]) and wf["permissions"] == {"contents": "read"}   # CI touches no AWS
